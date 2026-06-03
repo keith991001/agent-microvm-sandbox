@@ -1,5 +1,7 @@
 # agent-microvm-sandbox
 
+[![CI](https://github.com/keith991001/agent-microvm-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/keith991001/agent-microvm-sandbox/actions/workflows/ci.yml)
+
 A minimal **"1 command = 1 microVM"** sandbox, built from scratch in Go on Apple's
 **Virtualization.framework**. Each command runs in a brand-new, isolated Linux microVM
 that is created, used, and destroyed — a small-scale take on the execution model that
@@ -9,10 +11,7 @@ Code Interpreter.
 > Built as a learning project to deeply understand how microVM sandboxes achieve fast,
 > isolated, disposable command execution.
 
-```
-$ ./microvm "uname -a"
-Linux (none) 6.8.0-117-generic ... aarch64 GNU/Linux
-```
+![demo](docs/demo.gif)
 
 ## Why
 
@@ -34,17 +33,20 @@ End-to-end latency for one command (boot → run → return), as the design evol
 
 ## Architecture
 
-```
-host (main.go)                                  guest microVM
-  ┌─────────────────────────┐                   ┌────────────────────────┐
-  │ CLI / HTTP service       │                  │ kernel + Ubuntu rootfs │
-  │ warm pool of VMs         │   vsock          │ (ro) + tmpfs scratch   │
-  │  ── connect ──────────────────────────────► │ guest-agent (listens)  │
-  │  ── command ─────────────────────────────►  │  runs cmd via bash     │
-  │  ◄── JSON{stdout,stderr,exit} ────────────── │  powers off            │
-  └─────────────────────────┘                   └────────────────────────┘
-       │ virtio-fs (ships the agent binary into the guest)
-       │ serial (one-time bootstrap only)
+```mermaid
+flowchart LR
+    subgraph host["host (main.go)"]
+        CLI["CLI / HTTP service<br/>+ warm pool"]
+    end
+    subgraph guest["guest microVM"]
+        Agent["guest-agent<br/>(listens on vsock)"]
+        Root["kernel + Ubuntu rootfs (ro)<br/>+ tmpfs scratch"]
+        Agent --- Root
+    end
+    CLI == "vsock: command" ==> Agent
+    Agent == "vsock: JSON {stdout, stderr, exit}" ==> CLI
+    CLI -. "virtio-fs: ship agent binary" .-> guest
+    CLI -. "serial: one-time bootstrap" .-> guest
 ```
 
 - **Host** configures and boots the VM, ships the agent in via **virtio-fs**, and talks to

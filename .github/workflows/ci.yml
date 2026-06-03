@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    # macOS (Apple Silicon) runner: the host package uses Virtualization.framework via cgo
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Vet host (darwin/arm64)
+        run: go vet .
+
+      - name: Build host (darwin/arm64)
+        run: go build -o /dev/null .
+
+      - name: Vet + build guest-agent (linux/arm64)
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          go vet ./guest-agent
+          go build -o /dev/null ./guest-agent
