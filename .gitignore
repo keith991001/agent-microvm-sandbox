@@ -1,0 +1,10 @@
+# VM 资产（大文件 / 可重新下载生成，不入库）
+/vm/
+
+# 交叉编译/构建产物
+/share/agent
+/microvm
+/vmtest
+
+# macOS
+.DS_Store
