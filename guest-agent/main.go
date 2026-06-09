@@ -1,10 +1,9 @@
-// guest-agent：在 microVM 内部运行（Linux/arm64）。
-// 监听 vsock，收一条命令，在 tmpfs 临时区里用 bash 执行（带超时、整组终止），
-// 把 stdout/stderr/退出码 以 JSON 回传，然后关机。
+// guest-agent：microVM 内部で動く（Linux/arm64）。
+// vsock で JSON リクエスト {cmd, stdin, timeout_ms} を受け取り、tmpfs 上で bash 実行、
+// {stdout, stderr, exit, timed_out, duration_ms} を JSON で返し、電源を切る。
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -18,22 +17,28 @@ import (
 )
 
 const (
-	vsockPort  = 1024
-	cmdTimeout = 30 * time.Second
+	vsockPort        = 1024
+	defaultTimeoutMs = 30000
 )
 
+type request struct {
+	Cmd       string `json:"cmd"`
+	Stdin     string `json:"stdin"`
+	TimeoutMs int    `json:"timeout_ms"`
+}
+
 type result struct {
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
-	Exit   int    `json:"exit"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	Exit       int    `json:"exit"`
+	TimedOut   bool   `json:"timed_out"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 func main() {
-	// 命令运行所需的挂载
 	_ = unix.Mount("proc", "/proc", "proc", 0, "")
 	_ = unix.Mount("sysfs", "/sys", "sysfs", 0, "")
-	// 可写临时区：tmpfs 挂在已存在的 /tmp 上（根只读，但其上的 tmpfs 可写、关机即清空）
-	_ = unix.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")
+	_ = unix.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777") // 使い捨ての書き込み領域
 
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -53,55 +58,65 @@ func main() {
 	}
 	conn := os.NewFile(uintptr(nfd), "vsock-conn")
 
-	cmd, _ := bufio.NewReader(conn).ReadString('\n')
-	cmd = strings.TrimRight(cmd, "\r\n")
+	var req request
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
+		_ = json.NewEncoder(conn).Encode(result{Stderr: "bad request: " + err.Error(), Exit: 127})
+		shutdown(conn)
+	}
 
-	res := run(cmd)
-
-	_ = json.NewEncoder(conn).Encode(res)
-	conn.Close()
-
-	unix.Sync()
-	_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+	_ = json.NewEncoder(conn).Encode(run(req))
+	shutdown(conn)
 }
 
-// run 在 tmpfs 里用 bash 执行命令，带超时与整组终止
-func run(cmd string) result {
+// run はジャッジ向け：stdin を渡し、時間を計測し、タイムアウトはプロセスグループごと kill
+func run(req request) result {
+	timeout := time.Duration(req.TimeoutMs) * time.Millisecond
+	if req.TimeoutMs <= 0 {
+		timeout = defaultTimeoutMs * time.Millisecond
+	}
+
 	var so, se bytes.Buffer
-	c := exec.Command("/bin/bash", "-c", cmd)
+	c := exec.Command("/bin/bash", "-c", req.Cmd)
 	c.Dir = "/tmp"
 	c.Env = []string{
 		"HOME=/tmp", "TMPDIR=/tmp", "TERM=dumb",
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	}
+	c.Stdin = strings.NewReader(req.Stdin) // テスト入力を標準入力へ
 	c.Stdout = &so
 	c.Stderr = &se
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // 独立进程组，便于整组杀
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	exit := 0
+	start := time.Now()
+	res := result{}
 	if err := c.Start(); err != nil {
-		se.WriteString(err.Error())
-		return result{so.String(), se.String(), 127}
+		return result{Stderr: err.Error(), Exit: 127}
 	}
-
 	done := make(chan error, 1)
 	go func() { done <- c.Wait() }()
-
 	select {
 	case werr := <-done:
 		if ee, ok := werr.(*exec.ExitError); ok {
-			exit = ee.ExitCode()
+			res.Exit = ee.ExitCode()
 		} else if werr != nil {
-			exit = 127
-			se.WriteString(werr.Error())
+			res.Exit, se = 127, *bytes.NewBufferString(se.String()+werr.Error())
 		}
-	case <-time.After(cmdTimeout):
-		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) // 杀整个进程组（含子孙）
+	case <-time.After(timeout):
+		syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 		<-done
-		exit = 124
-		se.WriteString(fmt.Sprintf("\n[agent] 命令超时（>%s）已被终止\n", cmdTimeout))
+		res.Exit = 124
+		res.TimedOut = true
 	}
-	return result{so.String(), se.String(), exit}
+	res.DurationMs = time.Since(start).Milliseconds()
+	res.Stdout, res.Stderr = so.String(), se.String()
+	return res
+}
+
+func shutdown(conn *os.File) {
+	conn.Close()
+	unix.Sync()
+	_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
+	os.Exit(0)
 }
 
 func bail(msg string) {

@@ -2,23 +2,31 @@
 
 [![CI](https://github.com/keith991001/agent-microvm-sandbox/actions/workflows/ci.yml/badge.svg)](https://github.com/keith991001/agent-microvm-sandbox/actions/workflows/ci.yml)
 
-A minimal **"1 command = 1 microVM"** sandbox, built from scratch in Go on Apple's
-**Virtualization.framework**. Each command runs in a brand-new, isolated Linux microVM
-that is created, used, and destroyed — a small-scale take on the execution model that
-Firecracker popularized and that powers code-execution platforms like E2B, Modal, and
-Code Interpreter.
+A minimal **"1 command = 1 microVM"** sandbox for **safely running untrusted code** —
+built from scratch in Go on Apple's **Virtualization.framework**. Each run executes in a
+brand-new, isolated Linux microVM that is created, used, and destroyed, so nothing leaks
+between runs. A small-scale take on the model that Firecracker popularized.
+
+It is designed for **stateless, one-shot execution of untrusted code**, which fits two
+use cases especially well:
+
+- **LLM code-execution tools** — run a model-generated snippet once and return the result.
+- **Online judges / autograders** — run a submission against test cases with stdin,
+  a time limit, no network, and a fresh VM per run.
 
 > Built as a learning project to deeply understand how microVM sandboxes achieve fast,
-> isolated, disposable command execution.
+> isolated, disposable code execution.
 
 ![demo](docs/demo.gif)
 
-## Why
+## Why this model fits judging / code-execution
 
-AI agents increasingly run untrusted, generated code. Running that code directly on the
-host is dangerous; plain containers share the host kernel. A **microVM** gives a real
-hardware-virtualization boundary while staying lightweight enough to spin up per command.
-This project implements that idea end to end on macOS (Apple Silicon).
+Running untrusted, generated code directly on the host is dangerous; plain containers
+share the host kernel. A **microVM** gives a real hardware-virtualization boundary while
+staying lightweight enough to spin up per run. Because each run is **stateless and
+disposable**, one run can never affect another — exactly what an autograder or a
+code-execution tool needs. (For *stateful* workflows like coding agents that edit a
+project over many steps, a long-lived session sandbox would be the right model instead.)
 
 ## Performance
 
@@ -112,15 +120,40 @@ One-shot:
 
 ```bash
 ./microvm "uname -a"
-./microvm "echo hi; whoami; nproc"
+
+# feed test input via stdin (judge-style), with a time limit:
+echo "5 3" | ./microvm -timeout 2000 "read a b; echo $((a+b))"
+# 8
+# [exit=0  time=7ms]
 ```
 
-HTTP service with a warm pool:
+HTTP service with a warm pool (tens of ms per request on a pool hit):
 
 ```bash
 ./microvm -serve -pool 2 -addr :8080
-curl -s :8080/run -d '{"cmd":"echo hello"}'
-# {"stdout":"hello\n","stderr":"","exit":0}
+
+curl -s :8080/run -d '{"cmd":"python3 -c \"print(6*7)\""}'
+# {"stdout":"42\n","stderr":"","exit":0,"timed_out":false,"duration_ms":31}
+
+# autograder-style: program reads from stdin, with a per-run timeout
+curl -s :8080/run -d '{"cmd":"python3 solve.py","stdin":"5 3\n","timeout_ms":2000}'
+```
+
+**Request**: `{"cmd": string, "stdin": string, "timeout_ms": number}`
+**Response**: `{"stdout", "stderr", "exit", "timed_out", "duration_ms"}` — `duration_ms` is the
+program's own runtime (excludes VM boot), and `timed_out` flags a time-limit kill (TLE).
+
+### Example: autograder
+
+[`examples/autograder.sh`](examples/autograder.sh) runs an untrusted submission against
+test cases, each in its own fresh, network-less, time-limited microVM:
+
+```
+$ ./examples/autograder.sh
+[5 3] -> AC
+[10 20] -> AC
+[100 -1] -> AC
+score: 3/3
 ```
 
 ## How it works (design notes)

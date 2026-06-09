@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,10 +27,19 @@ const (
 	readyMark     = "__VM_READY__"
 )
 
+// request：判題/コード実行のリクエスト
+type request struct {
+	Cmd       string `json:"cmd"`
+	Stdin     string `json:"stdin"`
+	TimeoutMs int    `json:"timeout_ms"`
+}
+
 type result struct {
-	Stdout string `json:"stdout"`
-	Stderr string `json:"stderr"`
-	Exit   int    `json:"exit"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	Exit       int    `json:"exit"`
+	TimedOut   bool   `json:"timed_out"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 // vmInstance 是一台已经启动、agent 正在 vsock 上监听的（热）虚拟机
@@ -42,6 +52,7 @@ func main() {
 	serve := flag.Bool("serve", false, "作为 HTTP 服务运行（带预热池）")
 	addr := flag.String("addr", ":8080", "HTTP 监听地址")
 	poolN := flag.Int("pool", 2, "预热池大小")
+	timeoutMs := flag.Int("timeout", 30000, "命令超时（毫秒）")
 	flag.Parse()
 	debug := os.Getenv("VM_DEBUG") != ""
 
@@ -50,17 +61,23 @@ func main() {
 		return
 	}
 
-	// 一次性模式：./microvm "命令"
+	// 一次性模式：./microvm [-timeout ms] "命令"
+	// 测试输入可通过管道喂给程序的 stdin： echo "5 3" | ./microvm "python3 solve.py"
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, `用法: microvm "<命令>"   或   microvm -serve [-pool N] [-addr :8080]`)
+		fmt.Fprintln(os.Stderr, `用法: microvm [-timeout ms] "<命令>"   或   microvm -serve [-pool N] [-addr :8080]`)
 		os.Exit(2)
+	}
+	var stdin string
+	if fi, _ := os.Stdin.Stat(); fi != nil && fi.Mode()&os.ModeCharDevice == 0 {
+		b, _ := io.ReadAll(os.Stdin) // 管道/重定向输入 → 作为程序 stdin
+		stdin = string(b)
 	}
 	inst, err := bootVM(debug)
 	if err != nil {
 		fatal("boot: " + err.Error())
 	}
-	res, err := inst.exec(args[0])
+	res, err := inst.exec(request{Cmd: args[0], Stdin: stdin, TimeoutMs: *timeoutMs})
 	if err != nil {
 		fatal("exec: " + err.Error())
 	}
@@ -68,7 +85,11 @@ func main() {
 	if res.Stderr != "" {
 		fmt.Fprint(os.Stderr, res.Stderr)
 	}
-	fmt.Fprintf(os.Stderr, "[microVM exit code: %d]\n", res.Exit)
+	verdict := ""
+	if res.TimedOut {
+		verdict = " TIMEOUT"
+	}
+	fmt.Fprintf(os.Stderr, "[exit=%d  time=%dms%s]\n", res.Exit, res.DurationMs, verdict)
 }
 
 // ---------------- HTTP 服务 (S7) ----------------
@@ -76,15 +97,13 @@ func main() {
 func runServer(addr string, n int, debug bool) {
 	p := newPool(n, debug)
 	http.HandleFunc("/run", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Cmd string `json:"cmd"`
-		}
+		var req request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Cmd == "" {
-			http.Error(w, `需要 JSON: {"cmd":"..."}`, http.StatusBadRequest)
+			http.Error(w, `需要 JSON: {"cmd":"...","stdin":"...","timeout_ms":N}`, http.StatusBadRequest)
 			return
 		}
 		inst := p.get() // 从热池取一台（已开好机）
-		res, err := inst.exec(req.Cmd)
+		res, err := inst.exec(req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -205,8 +224,8 @@ func bootVM(debug bool) (*vmInstance, error) {
 	}
 }
 
-// exec 向热 VM 发命令，收 JSON 结果（VM 执行完会自己 poweroff）
-func (inst *vmInstance) exec(cmd string) (result, error) {
+// exec 向热 VM 发 JSON 请求，收 JSON 结果（VM 执行完会自己 poweroff）
+func (inst *vmInstance) exec(req request) (result, error) {
 	devs := inst.vm.SocketDevices()
 	if len(devs) == 0 {
 		return result{}, fmt.Errorf("无 socket 设备")
@@ -225,7 +244,10 @@ func (inst *vmInstance) exec(cmd string) (result, error) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	fmt.Fprintln(conn, cmd)
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		conn.Close()
+		return result{}, err
+	}
 	var res result
 	derr := json.NewDecoder(conn).Decode(&res)
 	conn.Close()
