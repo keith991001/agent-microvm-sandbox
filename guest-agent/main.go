@@ -99,7 +99,7 @@ func run(req request) result {
 		if ee, ok := werr.(*exec.ExitError); ok {
 			res.Exit = ee.ExitCode()
 		} else if werr != nil {
-			res.Exit, se = 127, *bytes.NewBufferString(se.String()+werr.Error())
+			res.Exit, se = 127, *bytes.NewBufferString(se.String() + werr.Error())
 		}
 	case <-time.After(timeout):
 		syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
